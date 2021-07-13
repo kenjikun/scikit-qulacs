@@ -32,7 +32,7 @@ class QNNRegressor(QNN):
         circuit_depth: int,
         seed: int = 0,
         time_step: float = 0.7,
-        solver: Literal["BFGS", "Nelder-Mead"] = "Nelder-Mead",
+        solver: Literal["BFGS", "Nelder-Mead","Adam"] = "Adam",
         circuit_arch: Literal["default"] = "default",
         n_shot: int = np.inf,
         cost: Literal["mse"] = "mse",
@@ -92,18 +92,42 @@ class QNNRegressor(QNN):
             self.obss[i].add_operator(1.0, f"Z {i}")  # Z0, Z1, Z2をオブザーバブルとして設定
 
         theta_init = self._get_output_gate_parameters()
-        print(theta_init)
-        result = minimize(
-            self.cost_func,
-            theta_init,
-            args=(x_train, y_train),
-            method=self.solver,
-            # jac=self._cost_func_grad,
-            options={"maxiter": maxiter},
-        )
-        print(self._get_output_gate_parameters())
-        loss = result.fun
-        theta_opt = result.x
+        if self.solver=="Adam":
+            pr_A=0.25
+            pr_Bi=0.6
+            pr_Bt=0.99
+            pr_ips=0.0000001
+            #ここまでがハイパーパラメータ
+            Bix=0
+            Btx=0
+
+            moment=np.zeros(len(theta_init))
+            vel=0
+            theta_now=theta_init
+            maxiter*=len(x_train)
+            for iter in range(0,maxiter,5):
+                grad=self._cost_func_grad(theta_now,x_train[iter%len(x_train):iter%len(x_train)+5],y_train[iter%len(y_train):iter%len(y_train)+5])
+                moment=moment*pr_Bi+(1-pr_Bi)*grad
+                vel=vel*pr_Bt+(1-pr_Bt)*np.dot(grad,grad)
+                Bix=Bix*pr_Bi+(1-pr_Bi)
+                Btx=Btx*pr_Bt+(1-pr_Bt)
+                theta_now-=pr_A/(((vel/Btx)**0.5)+pr_ips) * (moment/Bix)
+                if iter%len(x_train)<5:
+                    print(self.cost_func(theta_now,x_train,y_train))
+
+            loss=self.cost_func(theta_now,x_train,y_train)
+            theta_opt=theta_now
+        else:
+            result = minimize(
+                self.cost_func,
+                theta_init,
+                args=(x_train, y_train),
+                method=self.solver,
+                jac=self._cost_func_grad,
+                options={"maxiter": maxiter,'disp':True}
+            )
+            loss = result.fun
+            theta_opt = result.x
         return loss, theta_opt
 
     def predict(self, x_test: List[List[float]]):
@@ -140,19 +164,33 @@ class QNNRegressor(QNN):
 
     def _init_output_gate(self):
         u_out = ParametricQuantumCircuit(self.n_qubit)
-        time_evol_gate = _create_time_evol_gate(
-            self.n_qubit, time_step=self.time_step, random_state=self.random_state
-        )
-
+        #time_evol_gate = _create_time_evol_gate(self.n_qubit, time_step=self.time_step, random_state=self.random_state)
+        #print(time_evol_gate)
+        tlotstep=2
         for _ in range(self.circuit_depth):
 
-            u_out.add_gate(time_evol_gate)
+            #u_out.add_gate(time_evol_gate)
+            Jx =np.zeros(self.n_qubit)
+            Jij=np.zeros((self.n_qubit,self.n_qubit))
+            for i in range(self.n_qubit):  # i runs 0 to nqubit-1
+                Jx[i] = -1.0 + 2.0 * np.random.rand()  # -1~1の乱数
+                for j in range(self.n_qubit):
+                    Jij[i][j] = -1.0 + 2.0 * np.random.rand()
+            for _ in range(tlotstep):
+                for i in range(self.n_qubit):
+                    u_out.add_RZ_gate(i, Jx[i]*self.time_step/tlotstep)
+                    for j in range(self.n_qubit):
+                        if i==j:
+                            continue
+                        u_out.add_CNOT_gate(i,j)
+                        u_out.add_RZ_gate(j,Jij[i][j]*self.time_step/tlotstep)
+                        u_out.add_CNOT_gate(i,j)
             for i in range(self.n_qubit):
-                angle = 2.0 * np.pi * self.random_state.rand() - np.pi
+                angle = 2.0 * np.pi * self.random_state.rand()
                 u_out.add_parametric_RX_gate(i, angle)
-                angle = 2.0 * np.pi * self.random_state.rand() - np.pi
+                angle = 2.0 * np.pi * self.random_state.rand()
                 u_out.add_parametric_RZ_gate(i, angle)
-                angle = 2.0 * np.pi * self.random_state.rand() - np.pi
+                angle = 2.0 * np.pi * self.random_state.rand()
                 u_out.add_parametric_RX_gate(i, angle)
         return u_out
 
@@ -208,34 +246,43 @@ class QNNRegressor(QNN):
             for ya in y_inr
         ]
 
-    """
-    # for BFGS
-    def _cost_func_grad(self, theta, x_train):
-        x_scaled=_min_max_scaling(x_test)
-        y_minus_t = self._predict_inner(theta, x_scaled) - self.y_list
-        B_grad_list = self._b_grad(theta, x_scaled)
-        grad = [np.sum(y_minus_t * B_gr) for B_gr in B_grad_list]
-        return np.array(grad)
+    def _cost_func_grad(self, theta, x_train,y_train):
+        #print(1)
+        self._update_output_gate(theta)
+        x_scaled = _min_max_scaling(x_train, self.scale_x_param)
+        y_scaled = self.do_y_scale(y_train)
+        mto=self._predict_inner(x_scaled).copy()
+        bbb=np.zeros((len(x_train),self.n_qubit))
+        for h in range(len(x_train)):
+            if (self.n_outputs==2):
+                for i in range(self.n_outputs):
+                    bbb[h][i]=(-y_scaled[h][i]+mto[h][i])/self.n_outputs
+            else:
+                bbb[h]=(-y_scaled[h]+mto[h])/self.n_outputs
 
-    # for BFGS
-    def _b_grad(self, theta, x_train):
-        # dB/dθのリストを返す
+                
+        #print(5)
+        
         theta_plus = [
-            theta.copy() + np.eye(len(theta))[i] * np.pi / 2.0
+            theta.copy() + (np.eye(len(theta))[i]  / 20.0)
             for i in range(len(theta))
         ]
         theta_minus = [
-            theta.copy() - np.eye(len(theta))[i] * np.pi / 2.0
+            theta.copy() - (np.eye(len(theta))[i]  / 20.0)
             for i in range(len(theta))
         ]
+        
 
-        grad = [
-            (
-                self._predict_inner(theta_plus[i], x_train)
-                - self._predict_inner(theta_minus[i], x_train)
-            )
-            / 2.0
-            for i in range(len(theta))
-        ]
-        return np.array(grad)
-    """
+        grad = np.zeros(len(theta))
+        for i in range(len(theta)):
+            self._update_output_gate(theta_plus[i])
+            aaa_f=self._predict_inner(x_scaled)
+            self._update_output_gate(theta_minus[i])
+            aaa_m=self._predict_inner(x_scaled) 
+            for j in range(len(x_train)):
+                grad[i]+=np.dot(aaa_f[j]-aaa_m[j],bbb[j])*10.0
+        
+        self._update_output_gate(theta)
+        grad/=len(x_train)
+        return grad
+
