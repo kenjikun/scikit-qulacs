@@ -34,7 +34,7 @@ class QNNClassification(QNN):
         num_class: int,
         seed: int = 0,
         time_step: float = 0.7,
-        solver: Literal["BFGS", "Nelder-Mead"] = "Nelder-Mead",
+        solver: Literal["BFGS", "Nelder-Mead","Adam"] = "BFGS",
         circuit_arch: Literal["default"] = "default",
         n_shot: int = np.inf,
         cost: Literal["log_loss"] = "log_loss",
@@ -60,6 +60,8 @@ class QNNClassification(QNN):
         self.obss = []
         self.random_state = RandomState(seed)
         self.seed = seed
+
+        self.debug=0
 
         self.output_gate = self._init_output_gate()  # U_out
 
@@ -87,16 +89,49 @@ class QNNClassification(QNN):
             self.obss[i].add_operator(1.0, f"Z {i}")  # Z0, Z1, Z2をオブザーバブルとして設定
 
         theta_init = self._get_output_gate_parameters()
-        result = minimize(
-            self.cost_func,
-            theta_init,
-            args=(x_train, y_train),
-            method=self.solver,
-            # jac=self._cost_func_grad,
-            options={"maxiter": maxiter},
-        )
-        loss = result.fun
-        theta_opt = result.x
+        print(self._cost_func_grad(theta_init,x_train,y_train))
+        if self.solver=="Adam":
+            pr_A=0.25
+            pr_Bi=0.6
+            pr_Bt=0.99
+            pr_ips=0.0000001
+            #ここまでがハイパーパラメータ
+            Bix=0
+            Btx=0
+
+            moment=np.zeros(len(theta_init))
+            vel=0
+            theta_now=theta_init
+            maxiter*=len(x_train)
+            for iter in range(0,maxiter,5):
+                grad=self._cost_func_grad(theta_now,x_train[iter%len(x_train):iter%len(x_train)+5],y_train[iter%len(y_train):iter%len(y_train)+5])
+                moment=moment*pr_Bi+(1-pr_Bi)*grad
+                vel=vel*pr_Bt+(1-pr_Bt)*np.dot(grad,grad)
+                Bix=Bix*pr_Bi+(1-pr_Bi)
+                Btx=Btx*pr_Bt+(1-pr_Bt)
+                theta_now-=pr_A/(((vel/Btx)**0.5)+pr_ips) * (moment/Bix)
+                if iter%len(x_train)<5:
+                    print(self.cost_func(theta_now,x_train,y_train))
+
+            loss=self.cost_func(theta_now,x_train,y_train)
+            theta_opt=theta_now
+
+        else:
+            result = minimize(
+                self.cost_func,
+                theta_init,
+                args=(x_train, y_train),
+                method=self.solver,
+                jac=self._cost_func_grad,
+                options={"maxiter": maxiter,'disp':True}
+            )
+            loss = result.fun
+            theta_opt = result.x
+        print(self._cost_func_grad(theta_opt,x_train,y_train))
+        print(self.cost_func(theta_opt,x_train,y_train))
+        theta_opt[11]+=0.05
+        print(self.cost_func(theta_opt,x_train,y_train))
+        theta_opt[11]-=0.05
         return loss, theta_opt
 
     def predict(self, x_test: List[List[float]]):
@@ -134,13 +169,27 @@ class QNNClassification(QNN):
 
     def _init_output_gate(self):
         u_out = ParametricQuantumCircuit(self.n_qubit)
-        time_evol_gate = _create_time_evol_gate(
-            self.n_qubit, time_step=self.time_step, random_state=self.random_state
-        )
-
+        #time_evol_gate = _create_time_evol_gate(self.n_qubit, time_step=self.time_step, random_state=self.random_state)
+        #print(time_evol_gate)
+        tlotstep=2
         for _ in range(self.circuit_depth):
 
-            u_out.add_gate(time_evol_gate)
+            #u_out.add_gate(time_evol_gate)
+            Jx =np.zeros(self.n_qubit)
+            Jij=np.zeros((self.n_qubit,self.n_qubit))
+            for i in range(self.n_qubit):  # i runs 0 to nqubit-1
+                Jx[i] = -1.0 + 2.0 * np.random.rand()  # -1~1の乱数
+                for j in range(self.n_qubit):
+                    Jij[i][j] = -1.0 + 2.0 * np.random.rand()
+            for _ in range(tlotstep):
+                for i in range(self.n_qubit):
+                    u_out.add_RZ_gate(i, Jx[i]*self.time_step/tlotstep)
+                    for j in range(self.n_qubit):
+                        if i==j:
+                            continue
+                        u_out.add_CNOT_gate(i,j)
+                        u_out.add_RZ_gate(j,Jij[i][j]*self.time_step/tlotstep)
+                        u_out.add_CNOT_gate(i,j)
             for i in range(self.n_qubit):
                 angle = 2.0 * np.pi * self.random_state.rand()
                 u_out.add_parametric_RX_gate(i, angle)
@@ -238,14 +287,14 @@ class QNNClassification(QNN):
     def rev_y_scale(self, y_inr):
         # argmaxをとる
         # one-hot表現の受け取りをしたら、それを与えられた番号にして返す
-        print(y_inr)
+        #print(y_inr)
         res = np.zeros((len(y_inr), len(self.scale_y_param[0])), dtype=int)
         for i in range(len(y_inr)):
             for j in range(len(self.scale_y_param[0])):
                 hid = self.scale_y_param[1][j]
                 sai = -9999
                 arg = 0
-                print(self.scale_y_param[0][j])
+                #print(self.scale_y_param[0][j])
                 for k in range(self.scale_y_param[0][j]):
                     if sai < y_inr[i][hid + k]:
                         sai = y_inr[i][hid + k]
@@ -253,33 +302,53 @@ class QNNClassification(QNN):
                 res[i][j] = arg
         return res
 
-    """
+    
     # for BFGS
-    def _cost_func_grad(self, theta, x_train):
-        y_minus_t = self._predict_inner(theta, x_train) - self.y_list
-        B_grad_list = self._b_grad(theta, x_train)
-        grad = [np.sum(y_minus_t * B_gr) for B_gr in B_grad_list]
-        return np.array(grad)
-
-    # for BFGS
-    def _b_grad(self, theta, x_train):
-        # dB/dθのリストを返す
+    #書きかけ
+    def _cost_func_grad(self, theta, x_train,y_train):
+        
+        #print(1)
+        self._update_output_gate(theta)
+        x_scaled = _min_max_scaling(x_train, self.scale_x_param)
+        y_scaled = self.do_y_scale(y_train)
+        mto=self._predict_inner(x_scaled).copy()
+        bbb=np.zeros((len(x_train),self.n_qubit))
+        for h in range(len(x_train)):
+            for j in range(len(self.scale_y_param[0])):
+                hid = self.scale_y_param[1][j]
+                wa = 0
+                for k in range(self.scale_y_param[0][j]):
+                    wa += np.exp(5 * mto[h][hid + k])
+                # print(wa)
+                for k in range(self.scale_y_param[0][j]):
+                    mto[h][hid+k]=(np.exp(5 *mto[h][hid + k]) / wa)
+            for i in range(len(y_scaled[0])):
+                if y_scaled[h][i] == 0:
+                    bbb[h][i]=1.0/(1.0-mto[h][i])
+                else:
+                    bbb[h][i]=-1.0/(mto[h][i])
+        #print(5)
+        
         theta_plus = [
-            theta.copy() + np.eye(len(theta))[i] * np.pi / 2.0
+            theta.copy() + (np.eye(len(theta))[i]  / 20.0)
             for i in range(len(theta))
         ]
         theta_minus = [
-            theta.copy() - np.eye(len(theta))[i] * np.pi / 2.0
+            theta.copy() - (np.eye(len(theta))[i]  / 20.0)
             for i in range(len(theta))
         ]
+        
 
-        grad = [
-            (
-                self._predict_inner(theta_plus[i], x_train)
-                - self._predict_inner(theta_minus[i], x_train)
-            )
-            / 2.0
-            for i in range(len(theta))
-        ]
-        return np.array(grad)
-    """
+        grad = np.zeros(len(theta))
+        for i in range(len(theta)):
+            self._update_output_gate(theta_plus[i])
+            aaa_f=self._predict_inner(x_scaled)
+            self._update_output_gate(theta_minus[i])
+            aaa_m=self._predict_inner(x_scaled) 
+            for j in range(len(x_train)):
+                grad[i]+=np.dot(aaa_f[j]-aaa_m[j],bbb[j])*10.0
+        
+        self._update_output_gate(theta)
+        grad/=len(x_train)
+        return grad
+
